@@ -1,3 +1,5 @@
+import socket
+
 import grpc
 import grpc_reflection.v1alpha.reflection as grpc_reflect
 import logging
@@ -8,11 +10,16 @@ from concurrent import futures
 from http import HTTPStatus
 from http.client import HTTPConnection
 
+from grpc_status import rpc_status
+from google.rpc import code_pb2, status_pb2
+
 from feed_pb2 import Image, DESCRIPTOR as feed_descriptor
 from feed_pb2_grpc import (
     ImageFeedServiceServicer,
     add_ImageFeedServiceServicer_to_server
 )
+
+_TIMEOUT = 10
 
 _PORT_ENV_VARIABLE = 'PORT'
 _DEFAULT_PORT = 8061
@@ -20,12 +27,14 @@ _DEFAULT_PORT = 8061
 _SERVICE_NAME = 'ImageFeedService'
 _URL_ENV_VARIABLE = 'CAMERA_URL'
 _REQUEST_URL_ENV_VARIABLE = 'REQUEST_URL'
+_USER_ENV_VARIABLE = 'USER'
+_PASS_ENV_VARIABLE = 'PWD'
 
 
 class Server(ImageFeedServiceServicer):
 
     def __init__(self, connection_url, request_url, user, password):
-        self.__connection = HTTPConnection(connection_url)
+        self.__connection = HTTPConnection(connection_url, timeout=_TIMEOUT)
         self.__request_url = request_url
 
         user_and_pass = b64encode(
@@ -33,15 +42,26 @@ class Server(ImageFeedServiceServicer):
         ).decode("ascii")
 
         self.__headers = {
-            'Accept': 'image/webp,image/png,image/svg+xml,image/*;q=0.8,video/*;q=0.8,*/*;q=0.5',
+            'Accept': 'image/webp,image/png,image/svg+xml,image/*;'
+                      'q=0.8,video/*;q=0.8,*/*;q=0.5',
             'Connection': 'keep-alive',
             'Accept-Encoding': 'gzip, deflate',
             'Authorization': f'Basic {user_and_pass}'
         }
 
     def Get(self, request, context):
-        self.__connection.request("GET", self.__request_url, headers=self.__headers)
-        response = self.__connection.getresponse()
+        try:
+            self.__connection.request(
+                "GET",
+                self.__request_url,
+                headers=self.__headers)
+            response = self.__connection.getresponse()
+        except socket.timeout:
+            logging.warning("Request timeout")
+            context.abort_with_status(rpc_status.to_status(
+                status_pb2.Status(
+                    code=code_pb2.UNAVAILABLE,
+                    message='Timeout on camera feed')))
         if response.status != HTTPStatus.OK:
             logging.critical("Received response with status %s", response.status)
             exit(1)
@@ -49,26 +69,25 @@ class Server(ImageFeedServiceServicer):
         return Image(data=img_bytes)
 
 
+def find_env_variable(variable_name):
+    variable = os.getenv(variable_name)
+    if not variable:
+        logging.critical(
+            f'Unable to find environment variable: {variable_name}')
+        exit(1)
+    return variable
+
+
 def main():
-    connection_url = os.getenv(_URL_ENV_VARIABLE)
-    if not connection_url:
-        logging.critical(
-            "Unable to find camera url: Set the %s environment variable.",
-            _URL_ENV_VARIABLE)
-        exit(1)
-    request_url = os.getenv(_REQUEST_URL_ENV_VARIABLE)
-    if not request_url:
-        logging.critical(
-            "Unable to find request url: Set the %s environment variable.",
-            _REQUEST_URL_ENV_VARIABLE)
-        exit(1)
+    connection_url = find_env_variable(_URL_ENV_VARIABLE)
+    request_url = find_env_variable(_REQUEST_URL_ENV_VARIABLE)
     logging.info(
         'Connected to \'%s\' with request url \'%s\'',
         connection_url,
         request_url
     )
-    user = 'admin'
-    password = 'admin'
+    user = find_env_variable(_USER_ENV_VARIABLE)
+    password = find_env_variable(_PASS_ENV_VARIABLE)
     server = grpc.server(futures.ThreadPoolExecutor())
     add_ImageFeedServiceServicer_to_server(
         Server(connection_url, request_url, user, password),
