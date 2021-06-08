@@ -8,7 +8,7 @@ import os
 from base64 import b64encode
 from concurrent import futures
 from http import HTTPStatus
-from http.client import HTTPConnection
+from http.client import HTTPConnection, HTTPException
 
 from grpc_status import rpc_status
 from google.rpc import code_pb2, status_pb2
@@ -37,17 +37,18 @@ class Server(ImageFeedServiceServicer):
         self.__connection = HTTPConnection(connection_url, timeout=_TIMEOUT)
         self.__request_url = request_url
 
-        user_and_pass = b64encode(
-            f'{user}:{password}'.encode('utf-8')
-        ).decode("ascii")
-
         self.__headers = {
             'Accept': 'image/webp,image/png,image/svg+xml,image/*;'
                       'q=0.8,video/*;q=0.8,*/*;q=0.5',
             'Connection': 'keep-alive',
             'Accept-Encoding': 'gzip, deflate',
-            'Authorization': f'Basic {user_and_pass}'
         }
+
+        if user and password:
+            user_and_pass = b64encode(
+                f'{user}:{password}'.encode('utf-8')
+            ).decode("ascii")
+            self.__headers['Authorization'] = f'Basic {user_and_pass}'
 
     def Get(self, request, context):
         try:
@@ -56,22 +57,30 @@ class Server(ImageFeedServiceServicer):
                 self.__request_url,
                 headers=self.__headers)
             response = self.__connection.getresponse()
-        except socket.timeout:
-            logging.warning("Request timeout")
+        except (socket.timeout, HTTPException) as ex:
+            logging.warning(
+                "Exception while getting image from camera feed: %s",
+                ex,
+                exc_info=True)
             context.abort_with_status(rpc_status.to_status(
                 status_pb2.Status(
                     code=code_pb2.UNAVAILABLE,
-                    message='Timeout on camera feed')))
+                    message=f"Exception while getting image from camera feed: {ex}")))
+
         if response.status != HTTPStatus.OK:
-            logging.critical("Received response with status %s", response.status)
-            exit(1)
+            logging.error("Received response with status %s", response.status)
+            context.abort_with_status(rpc_status.to_status(
+                status_pb2.Status(
+                    code=code_pb2.CANCELLED,
+                    message=f"Exception while getting image from camera feed: "
+                            f"Received status code {response.status}")))
         img_bytes = response.read()
         return Image(data=img_bytes)
 
 
-def find_env_variable(variable_name):
+def find_env_variable(variable_name, required=True):
     variable = os.getenv(variable_name)
-    if not variable:
+    if required and not variable:
         logging.critical(
             f'Unable to find environment variable: {variable_name}')
         exit(1)
@@ -86,8 +95,8 @@ def main():
         connection_url,
         request_url
     )
-    user = find_env_variable(_USER_ENV_VARIABLE)
-    password = find_env_variable(_PASS_ENV_VARIABLE)
+    user = find_env_variable(_USER_ENV_VARIABLE, required=False)
+    password = find_env_variable(_PASS_ENV_VARIABLE, required=False)
     server = grpc.server(futures.ThreadPoolExecutor())
     add_ImageFeedServiceServicer_to_server(
         Server(connection_url, request_url, user, password),
