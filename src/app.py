@@ -8,7 +8,7 @@ import os
 from base64 import b64encode
 from concurrent import futures
 from http import HTTPStatus
-from http.client import HTTPConnection, HTTPException
+from http.client import HTTPConnection, HTTPSConnection, HTTPException
 
 from grpc_status import rpc_status
 from google.rpc import code_pb2, status_pb2
@@ -25,6 +25,8 @@ _PORT_ENV_VARIABLE = 'PORT'
 _DEFAULT_PORT = 8061
 
 _SERVICE_NAME = 'ImageFeedService'
+_HTTPS_VARIABLE = 'HTTPS'
+_HTTPS_DEFAULT = 'False'
 _URL_ENV_VARIABLE = 'CAMERA_URL'
 _REQUEST_URL_ENV_VARIABLE = 'REQUEST_URL'
 _USER_ENV_VARIABLE = 'USER'
@@ -33,8 +35,9 @@ _PASS_ENV_VARIABLE = 'PWD'
 
 class Server(ImageFeedServiceServicer):
 
-    def __init__(self, connection_url, request_url, user, password):
-        self.__connection = HTTPConnection(connection_url, timeout=_TIMEOUT)
+    def __init__(self, connection_url, request_url, user, password, https):
+        connection_class = HTTPSConnection if https else HTTPConnection
+        self.__connection = connection_class(connection_url, timeout=_TIMEOUT)
         self.__request_url = request_url
 
         self.__headers = {
@@ -51,6 +54,7 @@ class Server(ImageFeedServiceServicer):
             self.__headers['Authorization'] = f'Basic {user_and_pass}'
 
     def Get(self, request, context):
+        self.__connection.connect()
         try:
             self.__connection.request(
                 "GET",
@@ -75,6 +79,7 @@ class Server(ImageFeedServiceServicer):
                     message=f"Exception while getting image from camera feed: "
                             f"Received status code {response.status}")))
         img_bytes = response.read()
+        self.__connection.close()
         return Image(data=img_bytes)
 
 
@@ -87,19 +92,33 @@ def find_env_variable(variable_name, required=True):
     return variable
 
 
+def find_https():
+    https = os.getenv(_HTTPS_VARIABLE, _HTTPS_DEFAULT)
+    if https in ('True', 'False'):
+        return https == 'True'
+    else:
+        logging.critical(
+            '\'%s\' should be a boolean variable: expected True or False',
+            _HTTPS_VARIABLE
+        )
+        exit(1)
+
+
 def main():
     connection_url = find_env_variable(_URL_ENV_VARIABLE)
     request_url = find_env_variable(_REQUEST_URL_ENV_VARIABLE)
+    https = find_https()
     logging.info(
-        'Connected to \'%s\' with request url \'%s\'',
+        'Connected to \'%s\' with request url \'%s\' with %s connection',
         connection_url,
-        request_url
+        request_url,
+        'secure' if https else 'unsecure'
     )
     user = find_env_variable(_USER_ENV_VARIABLE, required=False)
     password = find_env_variable(_PASS_ENV_VARIABLE, required=False)
     server = grpc.server(futures.ThreadPoolExecutor())
     add_ImageFeedServiceServicer_to_server(
-        Server(connection_url, request_url, user, password),
+        Server(connection_url, request_url, user, password, https),
         server
     )
     service_names = (
